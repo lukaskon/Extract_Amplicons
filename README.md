@@ -8,5 +8,5 @@ You can change the max amplicon size and the number of primer mismatches allowed
 
 Outputs to a new directory with the name of the primer:
 1) Directory called "hits" with all blast hits and filtered results,
-2) Directory called "amplicon_fasta" containing the predicted amplicon for each genome, if it has one.
-3) File called summary_primer.tsv with the headers Genome, Size, Multiple.
+2) Directory called "amplicon_fasta" containing the predicted amplicon(s) for each genome, if it has one.
+3) File called summary_primer.tsv with the headers Genome and Amplicon_Size.
