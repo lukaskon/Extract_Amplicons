@@ -1,0 +1,175 @@
+#!/bin/bash -l
+#SBATCH --job-name=blast_primers
+#SBATCH --output=logs/blast_primers_%A_%a.out
+#SBATCH --error=logs/blast_primers_%A_%a.err
+#SBATCH --array=0-17
+#SBATCH --time=01:00:00
+#SBATCH --mem=20G
+#SBATCH --cpus-per-task=1
+
+# This script is looking for primers with 85% ID and expected amplicons under 2000bp. Edit as necessary.
+
+module load ncbi-blast/2.16.0+
+module load samtools/1.18
+
+# Primer info
+PRIMER_FILE="primers/SIX14_primers.fasta"
+
+# Parameters
+MAX_DIST=2000           # Maximum distance between primers
+MISMATCHES_ALLOWED=3    # Number of mismatches allowed
+
+## do not change below
+
+PRIMER=$(basename "$PRIMER_FILE" | sed 's/_primers\.fasta$//')
+
+# Extract FWD and REV sequences from primer file
+FWD=$(awk '/>FWD/{getline; print}' "$PRIMER_FILE")
+REV=$(awk '/>REV/{getline; print}' "$PRIMER_FILE")
+
+WORKDIR=$(pwd)
+
+# Directory for BLAST databases
+BLASTDB_DIR="/rhome/nicolel/bigdata/Fola/PutativeEffector/blast_databases"
+
+# Directory for primer-specific outputs
+PRIMERDIR="$WORKDIR/$PRIMER"
+mkdir -p "$PRIMERDIR/hits"
+mkdir -p "$PRIMERDIR/amplicon_fastas"
+
+# Copy primer file for BLAST input
+cp "$PRIMER_FILE" "$PRIMERDIR/${PRIMER}_primers.fasta"
+
+while [ ! -f "$PRIMERDIR/${PRIMER}_primers.fasta" ]; do sleep 1; done
+
+mapfile -t GENOMES < genome_list.txt
+GENOME="${GENOMES[$SLURM_ARRAY_TASK_ID]}"
+if [ -z "$GENOME" ]; then
+  echo "No genome for task $SLURM_ARRAY_TASK_ID"
+  exit 1
+fi
+
+BASENAME=$(basename "$GENOME" | sed 's/\.[^.]*$//')
+OUTFILE="$PRIMERDIR/hits/results_${PRIMER}_${BASENAME}.tsv"
+DBNAME="$BLASTDB_DIR/${BASENAME}_db"
+
+echo "Processing $GENOME → $OUTFILE"
+
+# Make BLAST db if needed
+if [[ -f "${DBNAME}.nhr" && -f "${DBNAME}.nin" && -f "${DBNAME}.nsq" ]]; then
+  echo "BLAST database $DBNAME exists."
+else
+  makeblastdb -in "$GENOME" -dbtype nucl -parse_seqids -out "$DBNAME"
+fi
+
+# Run BLAST
+blastn -query "$PRIMERDIR/${PRIMER}_primers.fasta" -db "$DBNAME" -task blastn-short \
+  -outfmt "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send" \
+  > "$PRIMERDIR/hits/hits_${PRIMER}_${BASENAME}.txt"
+
+# --- Match forward and reverse hits on same scaffold, opposite strands, within max size ---
+{
+    echo -e "Subject\tFWD_Start\tFWD_End\tREV_Start\tREV_End\tProduct_Size\tFWD_Strand\tREV_Strand"
+
+    awk -v plen_fwd=${#FWD} -v plen_rev=${#REV} \
+        -v mismatches=$MISMATCHES_ALLOWED -v max_size=$MAX_DIST '
+    function abs(x) { return x < 0 ? -x : x }
+
+    {
+        min_len_fwd = plen_fwd - mismatches
+        min_len_rev = plen_rev - mismatches
+
+        if (($1 == "FWD" && $3 >= (100 * min_len_fwd / plen_fwd) && $4 >= min_len_fwd) ||
+            ($1 == "REV" && $3 >= (100 * min_len_rev / plen_rev) && $4 >= min_len_rev)) {
+
+            scaf = $2
+            if (scaf ~ /^gb\|/) {
+                sub(/^gb\|/, "", scaf)
+                sub(/\|.*$/, "", scaf)
+            }
+
+            strand = ($9 <= $10) ? "+" : "-"
+            if ($1 == "FWD") {
+                fwd[scaf][strand] = $9 "\t" $10
+            } else if ($1 == "REV") {
+                rev[scaf][strand] = $9 "\t" $10
+            }
+        }
+    }
+
+    END {
+        for (scaf in fwd) {
+            for (strand in fwd[scaf]) {
+                split(fwd[scaf][strand], f, "\t")
+                oppstrand = (strand == "+" ? "-" : "+")
+                if (scaf in rev && oppstrand in rev[scaf]) {
+                    split(rev[scaf][oppstrand], r, "\t")
+                    dist = (f[1] < r[1]) ? r[1] - f[2] + 1 : f[1] - r[2] + 1
+                    if (dist <= max_size && dist > 0) {
+                        print scaf "\t" f[1] "\t" f[2] "\t" r[1] "\t" r[2] "\t" dist "\t" strand "\t" oppstrand
+                    }
+                }
+            }
+        }
+    }
+    ' "$PRIMERDIR/hits/hits_${PRIMER}_${BASENAME}.txt"
+
+} > "$OUTFILE"
+
+# Count hits and write summary
+AMP_COUNT=0
+if [ -s "$OUTFILE" ]; then
+  AMP_COUNT=$(($(wc -l < "$OUTFILE") - 1))
+fi
+
+SUMMARYFILE="$PRIMERDIR/summary_${PRIMER}.tsv"
+if [ ! -f "$SUMMARYFILE" ]; then
+  echo -e "Genome\tAmplicon_size" > "$SUMMARYFILE"
+fi
+
+ALL_SIZES="NA"
+if [ "$AMP_COUNT" -gt 0 ]; then
+  ALL_SIZES=$(tail -n +2 "$OUTFILE" | awk '{sizes = (sizes == "" ? $6 : sizes","$6)} END {print sizes}')
+fi
+
+echo -e "${BASENAME}\t${ALL_SIZES}" >> "$SUMMARYFILE"
+
+# Extract amplicons with samtools
+if [ "$AMP_COUNT" -gt 0 ]; then
+  # Index genome with samtools if needed
+  if [ ! -f "${GENOME}.fai" ]; then
+    samtools faidx "$GENOME"
+  fi
+
+  n=1
+  tail -n +2 "$OUTFILE" | while IFS=$'\t' read -r scaf fwd_start fwd_end rev_start rev_end prod_size fwd_strand rev_strand; do
+    if [ "$fwd_start" -lt "$rev_start" ]; then
+      start=$fwd_start
+      end=$rev_end
+      strand_fwd=$fwd_strand
+    else
+      start=$rev_start
+      end=$fwd_end
+      strand_fwd=$rev_strand
+    fi
+
+    region="${scaf}:${start}-${end}"
+    outfa="$PRIMERDIR/amplicon_fastas/${BASENAME}_${PRIMER}_amplicon_${n}.fasta"
+
+    samtools faidx "$GENOME" "$region" > "$outfa"
+
+    if [ "$strand_fwd" = "-" ]; then
+      # Reverse complement if FWD primer is on minus strand
+      seq=$(tail -n +2 "$outfa" | tr -d '\n' | tr 'ACGTacgt' 'TGCAtgca' | rev)
+      echo ">${BASENAME}|${scaf}:${start}-${end}" > "$outfa"
+      echo "$seq" >> "$outfa"
+    else
+      sed -i "1s/.*/>${BASENAME}_${scaf}:${start}-${end}/" "$outfa"
+    fi
+
+    echo "Amplicon $n extracted to $outfa"
+    n=$((n + 1))
+  done
+fi
+
+echo "✅ Done $BASENAME"
